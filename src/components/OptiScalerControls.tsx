@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { DropdownItem, Field, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
-import { runInstallFGMod, runUninstallFGMod, setDefaultFsr4Variant } from "../api";
+import { runInstallFGMod, runUninstallFGMod, setDefaultFsr4Variant, detectGpu } from "../api";
 import { OperationResult } from "./ResultDisplay";
 import { createAutoCleanupTimer } from "../utils";
 import { TIMEOUTS, PROXY_DLL_OPTIONS, DEFAULT_PROXY_DLL, FSR4_VARIANT_OPTIONS, DEFAULT_FSR4_VARIANT } from "../utils/constants";
@@ -27,6 +27,15 @@ interface OptiScalerControlsProps {
   fgmodInfo?: FgmodInfo | null;
 }
 
+interface GpuInfo {
+  status: string;
+  gpu_name: string;
+  is_amd: boolean;
+  detected_generation: string;
+  recommended_variant: string;
+  recommended_variant_label: string;
+}
+
 export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: OptiScalerControlsProps) {
   const [installing, setInstalling] = useState(false);
   const [uninstalling, setUninstalling] = useState(false);
@@ -38,6 +47,35 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
   const [fsr4Variant, setFsr4Variant] = useState<string>(DEFAULT_FSR4_VARIANT);
   const [fsr4VariantTouched, setFsr4VariantTouched] = useState(false);
   const [switchingVariant, setSwitchingVariant] = useState(false);
+  const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    detectGpu()
+      .then((result) => {
+        if (!cancelled && result?.status === "success") setGpuInfo(result);
+      })
+      .catch((e) => console.error(e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Before install, seed the default variant from the detected GPU (unless the
+  // user already picked one or a bundle is installed with its own choice).
+  useEffect(() => {
+    const recommended = gpuInfo?.recommended_variant;
+    if (
+      recommended &&
+      !fsr4VariantTouched &&
+      pathExists !== true &&
+      !fgmodInfo?.selected_fsr4_variant &&
+      FSR4_VARIANT_OPTIONS.some((option) => option.value === recommended)
+    ) {
+      setFsr4Variant(recommended);
+    }
+  }, [gpuInfo?.recommended_variant, fsr4VariantTouched, pathExists, fgmodInfo?.selected_fsr4_variant]);
+
   useEffect(() => {
     if (installResult) {
       return createAutoCleanupTimer(() => setInstallResult(null), TIMEOUTS.resultDisplay);
@@ -124,6 +162,21 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
       
       <OptiScalerHeader pathExists={pathExists} />
 
+      {gpuInfo && (
+        <PanelSectionRow>
+          <Field
+            label="Detected GPU"
+            description={
+              gpuInfo.is_amd
+                ? `${gpuInfo.detected_generation} - recommended runtime: ${gpuInfo.recommended_variant_label}`
+                : "Non-AMD/unknown GPU - using safe default runtime"
+            }
+          >
+            {gpuInfo.gpu_name}
+          </Field>
+        </PanelSectionRow>
+      )}
+
       <PanelSectionRow>
         <DropdownItem
           layout="below"
@@ -131,7 +184,13 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
           description={FSR4_VARIANT_OPTIONS.find((option) => option.value === fsr4Variant)?.hint}
           menuLabel="Default FSR4 runtime"
           selectedOption={fsr4Variant}
-          rgOptions={FSR4_VARIANT_OPTIONS.map((option) => ({ data: option.value, label: option.label }))}
+          rgOptions={FSR4_VARIANT_OPTIONS.map((option) => ({
+            data: option.value,
+            label:
+              gpuInfo?.recommended_variant === option.value
+                ? `${option.label} (recommended)`
+                : option.label,
+          }))}
           disabled={installing || uninstalling || switchingVariant}
           onChange={(option) => {
             void handleFsr4VariantChange(String(option.data));

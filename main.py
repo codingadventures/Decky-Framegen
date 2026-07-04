@@ -6,6 +6,9 @@ import shutil
 import re
 import filecmp
 import hashlib
+import time
+import urllib.request
+import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -189,6 +192,85 @@ LEGACY_FILES = [
     "OptiScaler.ini",
     "OptiScaler.log",
 ]
+
+# ── GPU detection ──────────────────────────────────────────────────────────
+AMD_VENDOR_IDS = {"0x1002", "1002"}
+
+# Marketing-name keywords that identify an RDNA4 GPU (native FSR4 path).
+RDNA4_NAME_MARKERS = [
+    "rx 90",
+    "radeon rx 9",
+    "9070",
+    "9060",
+    "navi 44",
+    "navi 48",
+]
+RDNA35_NAME_MARKERS = [
+    "radeon 890m",
+    "radeon 880m",
+    "strix",
+    "krackan",
+    "ryzen ai",
+]
+RDNA3_NAME_MARKERS = [
+    "radeon 780m",
+    "radeon 760m",
+    "radeon 740m",
+    "rx 7",
+    "navi 3",
+    "phoenix",
+    "hawk",
+]
+RDNA2_NAME_MARKERS = [
+    "van gogh",
+    "steam deck",
+    "aerith",
+    "sephiroth",
+    "rx 6",
+    "navi 2",
+    "680m",
+    "660m",
+]
+
+# Best-effort PCI device-id -> (generation, recommended FSR4 variant) map.
+# Names from lspci can be generic (e.g. "Device 150e"), so device ids help.
+AMD_DEVICE_ID_MAP = {
+    # RDNA2
+    "0x163f": ("RDNA2 (Van Gogh / Steam Deck)", "rdna23-int8"),
+    # RDNA3 APUs (Phoenix / Hawk Point - Z1 / Z1 Extreme)
+    "0x15bf": ("RDNA3 (Phoenix)", "rdna23-int8"),
+    "0x15c8": ("RDNA3 (Phoenix2)", "rdna23-int8"),
+    # RDNA3.5 APUs (Strix Point - Z2 Extreme / Legion Go 2)
+    "0x150e": ("RDNA3.5 (Strix Point)", "rdna23-int8"),
+    "0x1586": ("RDNA3.5 (Strix)", "rdna23-int8"),
+    # RDNA4 discrete
+    "0x7550": ("RDNA4 (Navi 48)", "rdna4-native"),
+    "0x7551": ("RDNA4 (Navi 48)", "rdna4-native"),
+    "0x7590": ("RDNA4 (Navi 44)", "rdna4-native"),
+}
+
+# ── Compatibility marking ──────────────────────────────────────────────────
+CURATED_COMPAT_URL = (
+    "https://raw.githubusercontent.com/wiki/optiscaler/OptiScaler/Compatibility-List.md"
+)
+CURATED_CACHE_FILENAME = "compat-curated-cache.json"
+SCAN_CACHE_FILENAME = "compat-scan-cache.json"
+OVERRIDES_FILENAME = "compat-overrides.json"
+CURATED_CACHE_TTL_SECONDS = 24 * 60 * 60  # refresh at most once a day
+COMPAT_SCAN_MAX_DEPTH = 6
+
+# Signature files that indicate a game already exposes an upscaler OptiScaler can hook.
+UPSCALER_SIGNATURES = {
+    "dlss": ["nvngx_dlss.dll"],
+    "xess": ["libxess.dll"],
+    "fsr": [
+        "amd_fidelityfx_dx12.dll",
+        "amd_fidelityfx_vk.dll",
+        "ffx_fsr2_api_dx12_x64.dll",
+        "ffx_fsr2_api_vk_x64.dll",
+    ],
+}
+VALID_COMPAT_OVERRIDES = {"compatible", "incompatible", "clear"}
 
 class Plugin:
     async def _main(self):
@@ -882,6 +964,116 @@ class Plugin:
             "selected_fsr4_variant_label": FSR4_VARIANTS[selected_variant]["label"],
             "install_manifest_present": bool(manifest),
         }
+
+    # ── GPU detection ──────────────────────────────────────────────────────────
+
+    def _read_amd_devices_from_sys(self) -> list[dict]:
+        devices: list[dict] = []
+        try:
+            for card in sorted(Path("/sys/class/drm").glob("card*")):
+                device_dir = card / "device"
+                vendor_file = device_dir / "vendor"
+                device_file = device_dir / "device"
+                if not vendor_file.exists() or not device_file.exists():
+                    continue
+                try:
+                    vendor = vendor_file.read_text(encoding="utf-8").strip().lower()
+                    device = device_file.read_text(encoding="utf-8").strip().lower()
+                except Exception:
+                    continue
+                if vendor in AMD_VENDOR_IDS:
+                    devices.append({"vendor": vendor, "device": device})
+        except Exception as exc:
+            decky.logger.info(f"[Framegen] sysfs GPU scan failed: {exc}")
+        return devices
+
+    def _read_gpu_name_from_lspci(self) -> tuple[str, bool]:
+        """Return (gpu_name, is_amd) parsed from lspci output, best-effort."""
+        try:
+            result = subprocess.run(["lspci"], capture_output=True, text=True, check=False)
+        except Exception as exc:
+            decky.logger.info(f"[Framegen] lspci unavailable: {exc}")
+            return "", False
+
+        fallback_name = ""
+        for line in result.stdout.splitlines():
+            low = line.lower()
+            if not (
+                "vga compatible controller" in low
+                or "display controller" in low
+                or "3d controller" in low
+            ):
+                continue
+            name_part = line.split(": ", 1)[1].strip() if ": " in line else line.strip()
+            if any(marker in low for marker in ["amd", "advanced micro devices", "ati", "radeon"]):
+                return name_part, True
+            if not fallback_name:
+                fallback_name = name_part
+        return fallback_name, False
+
+    def _classify_amd_gpu(self, gpu_name: str, amd_devices: list[dict]) -> tuple[str, str]:
+        """Map a GPU name / device ids to (generation, recommended_variant)."""
+        name_low = (gpu_name or "").lower()
+
+        def matches(markers: list[str]) -> bool:
+            return any(marker in name_low for marker in markers)
+
+        if matches(RDNA4_NAME_MARKERS):
+            return "RDNA4", "rdna4-native"
+        if matches(RDNA35_NAME_MARKERS):
+            return "RDNA3.5", "rdna23-int8"
+        if matches(RDNA3_NAME_MARKERS):
+            return "RDNA3", "rdna23-int8"
+        if matches(RDNA2_NAME_MARKERS):
+            return "RDNA2", "rdna23-int8"
+
+        for device in amd_devices:
+            mapped = AMD_DEVICE_ID_MAP.get(device.get("device", ""))
+            if mapped:
+                return mapped[0], mapped[1]
+
+        return "AMD (generic)", DEFAULT_FSR4_VARIANT
+
+    async def detect_gpu(self) -> dict:
+        """Detect the primary GPU and recommend an FSR4 runtime variant."""
+        try:
+            gpu_name, is_amd = self._read_gpu_name_from_lspci()
+            amd_devices = self._read_amd_devices_from_sys()
+            if amd_devices:
+                is_amd = True
+
+            if is_amd:
+                detected_generation, recommended_variant = self._classify_amd_gpu(gpu_name, amd_devices)
+            else:
+                detected_generation = "non-AMD / unknown"
+                recommended_variant = DEFAULT_FSR4_VARIANT
+
+            if recommended_variant not in FSR4_VARIANTS:
+                recommended_variant = DEFAULT_FSR4_VARIANT
+
+            decky.logger.info(
+                f"[Framegen] detect_gpu: name='{gpu_name}' amd={is_amd} "
+                f"gen={detected_generation} variant={recommended_variant} devices={amd_devices}"
+            )
+            return {
+                "status": "success",
+                "gpu_name": gpu_name or ("AMD GPU" if is_amd else "Unknown GPU"),
+                "is_amd": is_amd,
+                "detected_generation": detected_generation,
+                "recommended_variant": recommended_variant,
+                "recommended_variant_label": FSR4_VARIANTS[recommended_variant]["label"],
+            }
+        except Exception as exc:
+            decky.logger.error(f"[Framegen] detect_gpu failed: {exc}")
+            return {
+                "status": "error",
+                "message": str(exc),
+                "gpu_name": "Unknown GPU",
+                "is_amd": False,
+                "detected_generation": "unknown",
+                "recommended_variant": DEFAULT_FSR4_VARIANT,
+                "recommended_variant_label": FSR4_VARIANTS[DEFAULT_FSR4_VARIANT]["label"],
+            }
 
     def _resolve_target_directory(self, directory: str) -> Path:
         decky.logger.info(f"Resolving target directory: {directory}")
@@ -1671,4 +1863,207 @@ class Plugin:
             }
         except Exception as exc:
             decky.logger.error(f"[Framegen] unpatch_game failed for {appid}: {exc}")
+            return {"status": "error", "message": str(exc)}
+
+    # ── Compatibility marking ──────────────────────────────────────────────────
+
+    def _fgmod_data_dir(self) -> Path:
+        path = Path(decky.HOME) / "fgmod"
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            decky.logger.info(f"[Framegen] could not create fgmod data dir: {exc}")
+        return path
+
+    def _normalize_game_name(self, name: str) -> str:
+        return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+
+    def _scan_game_upscalers(self, install_path: Path) -> list[str]:
+        """Depth-limited walk looking for known upscaler signature DLLs."""
+        found: set[str] = set()
+        if not install_path or not install_path.exists():
+            return []
+        signature_lookup: dict[str, str] = {}
+        for tech, files in UPSCALER_SIGNATURES.items():
+            for filename in files:
+                signature_lookup[filename.lower()] = tech
+        total_techs = len(UPSCALER_SIGNATURES)
+        root_depth = len(install_path.parts)
+        try:
+            for current_root, dirs, files in os.walk(install_path):
+                depth = len(Path(current_root).parts) - root_depth
+                if depth >= COMPAT_SCAN_MAX_DEPTH:
+                    dirs[:] = []
+                for filename in files:
+                    tech = signature_lookup.get(filename.lower())
+                    if tech:
+                        found.add(tech)
+                if len(found) >= total_techs:
+                    break
+        except Exception as exc:
+            decky.logger.info(f"[Framegen] upscaler scan failed for {install_path}: {exc}")
+        return sorted(found)
+
+    def _dir_signature(self, install_path: Path) -> str:
+        try:
+            st = install_path.stat()
+            return f"{int(st.st_mtime)}:{st.st_size}"
+        except Exception:
+            return "0"
+
+    def _load_scan_cache(self) -> dict:
+        return self._read_json_file(self._fgmod_data_dir() / SCAN_CACHE_FILENAME)
+
+    def _save_scan_cache(self, cache: dict) -> None:
+        try:
+            self._write_json_file(self._fgmod_data_dir() / SCAN_CACHE_FILENAME, cache)
+        except Exception as exc:
+            decky.logger.info(f"[Framegen] failed to save scan cache: {exc}")
+
+    def _parse_curated_markdown(self, raw: str) -> set[str]:
+        """Extract normalized game names from the first column of the wiki table."""
+        names: set[str] = set()
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line.startswith("|"):
+                continue
+            cells = [cell.strip() for cell in line.strip("|").split("|")]
+            if not cells:
+                continue
+            first = cells[0]
+            if not first or set(first) <= set("-: "):
+                continue
+            link_match = re.match(r"\[([^\]]+)\]\([^)]*\)", first)
+            if link_match:
+                first = link_match.group(1)
+            first = first.strip().strip("*").strip()
+            low = first.lower()
+            if low in ("game", "name") or first.startswith("#"):
+                continue
+            normalized = self._normalize_game_name(first)
+            if len(normalized) >= 2:
+                names.add(normalized)
+        return names
+
+    def _load_curated_compat(self, force_refresh: bool = False) -> dict:
+        cache_path = self._fgmod_data_dir() / CURATED_CACHE_FILENAME
+        cached = self._read_json_file(cache_path)
+        now = time.time()
+        if (
+            not force_refresh
+            and cached.get("names")
+            and (now - float(cached.get("fetched_at", 0) or 0)) < CURATED_CACHE_TTL_SECONDS
+        ):
+            return cached
+        try:
+            request = urllib.request.Request(
+                CURATED_COMPAT_URL, headers={"User-Agent": "Decky-Framegen"}
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                raw = response.read().decode("utf-8", errors="replace")
+            names = self._parse_curated_markdown(raw)
+            if names:
+                payload = {"fetched_at": now, "names": sorted(names), "count": len(names)}
+                self._write_json_file(cache_path, payload)
+                return payload
+            decky.logger.info("[Framegen] curated compat list parsed to 0 names; keeping cache")
+        except Exception as exc:
+            decky.logger.info(f"[Framegen] curated compat fetch failed: {exc}")
+        return cached if cached.get("names") else {"fetched_at": 0, "names": [], "count": 0}
+
+    def _load_overrides(self) -> dict:
+        return self._read_json_file(self._fgmod_data_dir() / OVERRIDES_FILENAME)
+
+    def _save_overrides(self, overrides: dict) -> None:
+        self._write_json_file(self._fgmod_data_dir() / OVERRIDES_FILENAME, overrides)
+
+    async def set_game_compat_override(self, appid: str, value: str) -> dict:
+        try:
+            value = str(value or "").strip().lower()
+            if value not in VALID_COMPAT_OVERRIDES:
+                return {"status": "error", "message": f"Invalid override value: {value}"}
+            overrides = self._load_overrides()
+            if value == "clear":
+                overrides.pop(str(appid), None)
+                stored = None
+            else:
+                overrides[str(appid)] = value
+                stored = value
+            self._save_overrides(overrides)
+            return {"status": "success", "appid": str(appid), "override": stored}
+        except Exception as exc:
+            decky.logger.error(f"[Framegen] set_game_compat_override failed: {exc}")
+            return {"status": "error", "message": str(exc)}
+
+    async def list_games_compatibility(self, force_refresh: bool = False) -> dict:
+        try:
+            games = self._find_installed_games()
+            curated = self._load_curated_compat(force_refresh=force_refresh)
+            curated_names = set(curated.get("names") or [])
+            overrides = self._load_overrides()
+            scan_cache = self._load_scan_cache()
+            cache_dirty = False
+
+            results: list[dict] = []
+            for game in games:
+                appid = str(game["appid"])
+                name = game["name"]
+                install_path = Path(game["install_path"]) if game.get("install_path") else None
+                install_found = bool(install_path and install_path.exists())
+
+                upscalers: list[str] = []
+                if install_found:
+                    signature = self._dir_signature(install_path)
+                    cache_entry = scan_cache.get(appid)
+                    if isinstance(cache_entry, dict) and cache_entry.get("signature") == signature:
+                        upscalers = list(cache_entry.get("upscalers") or [])
+                    else:
+                        upscalers = self._scan_game_upscalers(install_path)
+                        scan_cache[appid] = {"signature": signature, "upscalers": upscalers}
+                        cache_dirty = True
+
+                scan_hit = len(upscalers) > 0
+                curated_hit = self._normalize_game_name(name) in curated_names
+                override = overrides.get(appid)
+
+                sources: list[str] = []
+                if scan_hit:
+                    sources.append("scan")
+                if curated_hit:
+                    sources.append("curated")
+                if override:
+                    sources.append("override")
+
+                if override == "incompatible":
+                    compat = "no"
+                elif override == "compatible":
+                    compat = "yes"
+                elif scan_hit:
+                    compat = "yes"
+                elif curated_hit:
+                    compat = "likely"
+                else:
+                    compat = "unknown"
+
+                results.append({
+                    "appid": appid,
+                    "name": name,
+                    "install_found": install_found,
+                    "compat": compat,
+                    "sources": sources,
+                    "upscalers": upscalers,
+                    "override": override,
+                })
+
+            if cache_dirty:
+                self._save_scan_cache(scan_cache)
+
+            return {
+                "status": "success",
+                "games": results,
+                "curated_count": curated.get("count", len(curated_names)),
+                "curated_available": bool(curated_names),
+            }
+        except Exception as exc:
+            decky.logger.error(f"[Framegen] list_games_compatibility failed: {exc}")
             return {"status": "error", "message": str(exc)}

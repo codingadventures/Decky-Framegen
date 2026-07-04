@@ -18,7 +18,34 @@ This plugin uses OptiScaler to replace DLSS calls with FSR3/FSR3.1, giving you:
 - **One-Click Setup**: Automatically downloads and installs OptiScaler into a "fgmod" directory
 - **Smart Installation**: Handles all required dependencies and library files
 - **Game Patching**: Easy copy-paste launch commands for enabling/disabling the mod per game
+- **GPU-Aware Defaults**: Detects your GPU and recommends the matching FSR4 runtime (RDNA4 native vs the RDNA2/3/3.5 INT8 override)
+- **Compatibility Marking**: Flags which installed games are OptiScaler compatible, with a "show compatible only" filter and a per-game manual override
 - **OptiScaler Wiki**: Direct access to OptiScaler documentation and settings via a webpage launch button right inside the plugin.
+
+### Supported Devices
+
+This is a Decky Loader plugin, so it works on any handheld/PC running SteamOS (or a compatible distro like Bazzite) with Decky Loader installed. Tested targets include the Steam Deck (LCD/OLED) and it also runs on other AMD handhelds such as the Lenovo Legion Go / Legion Go 2 (RDNA3 / RDNA3.5) and ROG Ally.
+
+On launch the plugin detects your GPU and pre-selects a sensible **Default FSR4 runtime**:
+- **RDNA4** (e.g. Radeon RX 9000 series) -> native FSR4 runtime
+- **RDNA2 / RDNA3 / RDNA3.5** (Steam Deck, Legion Go / Go 2, ROG Ally, etc.) -> the bundled INT8 override
+- **Unknown / non-AMD** -> safe INT8 default
+
+You can always override the runtime manually from the "Default FSR4 runtime" dropdown.
+
+### Which Games Are Compatible?
+
+OptiScaler works by hooking a game's existing upscaler, so it mainly benefits titles that already expose **DLSS 2+, FSR2+, or XeSS** (games with no upscaler at all only have the experimental OptiFG path). The plugin marks each installed game as:
+- **Compatible**: an upscaler DLL (`nvngx_dlss.dll`, `libxess.dll`, FSR FidelityFX libraries) was found in the game folder, or you marked it compatible.
+- **Likely**: the game appears on the community [OptiScaler compatibility list](https://github.com/optiscaler/OptiScaler/wiki/Compatibility-List) by name (useful for games that statically link FSR and have no detectable DLL).
+- **Unknown**: no signal either way.
+- **Not compatible**: you manually marked it as such.
+
+Use the **Show compatible only** toggle to filter the game dropdown, and the **Compatibility override** dropdown to force a per-game result. Detection is best-effort and cached; the curated list is fetched once a day and everything still works offline via the local scan.
+
+> **Note:** The game list and compatibility marking cover your **Steam library** only (they read Steam's `appmanifest` files). Games installed through Heroic (Epic/GOG/Amazon) or Lutris won't appear in the dropdown, but you can still patch them manually with the `~/fgmod/fgmod %command%` wrapper (the launcher script includes Lutris resolution).
+
+> **Heads up on frame generation:** OptiScaler already provides frame generation. Don't stack it with another frame-gen solution such as Lossless Scaling / `lsfg-vk` at the same time - two frame-gen layers compound latency and artifacts. Pick one for frame generation.
 
 ## How to Use
 

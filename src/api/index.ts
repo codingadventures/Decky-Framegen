@@ -45,6 +45,45 @@ export const listInstalledGames = callable<
   { status: string; message?: string; games: { appid: string; name: string; install_found?: boolean }[] }
 >("list_installed_games");
 
+export const detectGpu = callable<
+  [],
+  {
+    status: string;
+    message?: string;
+    gpu_name: string;
+    is_amd: boolean;
+    detected_generation: string;
+    recommended_variant: string;
+    recommended_variant_label: string;
+  }
+>("detect_gpu");
+
+export type GameCompat = {
+  appid: string;
+  name: string;
+  install_found: boolean;
+  compat: "yes" | "likely" | "unknown" | "no";
+  sources: string[];
+  upscalers: string[];
+  override?: string | null;
+};
+
+export const listGamesCompatibility = callable<
+  [force_refresh?: boolean],
+  {
+    status: string;
+    message?: string;
+    games: GameCompat[];
+    curated_count?: number;
+    curated_available?: boolean;
+  }
+>("list_games_compatibility");
+
+export const setGameCompatOverride = callable<
+  [appid: string, value: string],
+  { status: string; message?: string; appid?: string; override?: string | null }
+>("set_game_compat_override");
+
 export const logError = callable<[string], void>("log_error");
 
 export const getPathDefaults = callable<

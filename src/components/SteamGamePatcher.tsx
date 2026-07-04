@@ -1,8 +1,34 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
-import { ButtonItem, DropdownItem, Field, PanelSectionRow } from "@decky/ui";
+import { ButtonItem, DropdownItem, Field, PanelSectionRow, ToggleField } from "@decky/ui";
 import { toaster } from "@decky/api";
-import { listInstalledGames, getGameStatus, patchGame, unpatchGame } from "../api";
+import {
+  listInstalledGames,
+  getGameStatus,
+  patchGame,
+  unpatchGame,
+  listGamesCompatibility,
+  setGameCompatOverride,
+  GameCompat,
+} from "../api";
 import { FSR4_VARIANT_OPTIONS } from "../utils/constants";
+
+// ─── Compatibility display metadata ──────────────────────────────────────────
+
+const COMPAT_META: Record<
+  GameCompat["compat"],
+  { label: string; short: string; color: string }
+> = {
+  yes: { label: "Compatible", short: "Compatible", color: "#3fb950" },
+  likely: { label: "Likely compatible", short: "Likely", color: "#58a6ff" },
+  unknown: { label: "Unknown", short: "Unknown", color: "#ffd866" },
+  no: { label: "Marked not compatible", short: "Not compatible", color: "#f85149" },
+};
+
+const COMPAT_OVERRIDE_OPTIONS = [
+  { data: "clear", label: "Auto-detect" },
+  { data: "compatible", label: "Mark compatible" },
+  { data: "incompatible", label: "Mark not compatible" },
+] as const;
 
 // ─── SteamClient helpers ─────────────────────────────────────────────────────
 
@@ -76,8 +102,29 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
   const [statusLoading, setStatusLoading] = useState(false);
   const [busyAction, setBusyAction] = useState<"patch" | "unpatch" | null>(null);
   const [resultMessage, setResultMessage] = useState<string>("");
+  const [compatMap, setCompatMap] = useState<Record<string, GameCompat>>({});
+  const [compatLoading, setCompatLoading] = useState(true);
+  const [showCompatibleOnly, setShowCompatibleOnly] = useState(false);
+  const [overrideBusy, setOverrideBusy] = useState(false);
 
   // ── Data loaders ───────────────────────────────────────────────────────────
+
+  const loadCompat = useCallback(async () => {
+    setCompatLoading(true);
+    try {
+      const result = await listGamesCompatibility();
+      if (result.status === "success") {
+        const map: Record<string, GameCompat> = {};
+        for (const entry of result.games) map[entry.appid] = entry;
+        setCompatMap(map);
+      }
+    } catch (err) {
+      // non-fatal: compatibility hints are best-effort
+      console.error(err);
+    } finally {
+      setCompatLoading(false);
+    }
+  }, []);
 
   const loadGames = useCallback(async () => {
     setGamesLoading(true);
@@ -126,7 +173,8 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
 
   useEffect(() => {
     void loadGames();
-  }, [loadGames]);
+    void loadCompat();
+  }, [loadGames, loadCompat]);
 
   useEffect(() => {
     if (!selectedAppId) {
@@ -142,6 +190,20 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
     () => games.find((g) => g.appid === selectedAppId) ?? null,
     [games, selectedAppId]
   );
+
+  const selectedCompat = useMemo(
+    () => (selectedAppId ? compatMap[selectedAppId] ?? null : null),
+    [compatMap, selectedAppId]
+  );
+
+  const visibleGames = useMemo(() => {
+    if (!showCompatibleOnly) return games;
+    return games.filter((g) => {
+      const compat = compatMap[g.appid]?.compat;
+      // Always keep the current selection visible so it doesn't vanish.
+      return g.appid === selectedAppId || compat === "yes" || compat === "likely";
+    });
+  }, [games, compatMap, showCompatibleOnly, selectedAppId]);
 
   const selectedVariantLabel = useMemo(
     () => FSR4_VARIANT_OPTIONS.find((option) => option.value === fsr4Variant)?.label ?? fsr4Variant,
@@ -213,6 +275,24 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
     }
   }, [busyAction, loadStatus, selectedAppId, selectedGame]);
 
+  const handleSetOverride = useCallback(
+    async (value: string) => {
+      if (!selectedAppId || overrideBusy) return;
+      setOverrideBusy(true);
+      try {
+        const result = await setGameCompatOverride(selectedAppId, value);
+        if (result.status !== "success") throw new Error(result.message || "Failed to update.");
+        await loadCompat();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : "Failed to update compatibility.";
+        toaster.toast({ title: "Decky Framegen", body: msg });
+      } finally {
+        setOverrideBusy(false);
+      }
+    },
+    [selectedAppId, overrideBusy, loadCompat]
+  );
+
   // ── Status display ─────────────────────────────────────────────────────────
 
   const statusDisplay = useMemo(() => {
@@ -235,17 +315,32 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
   return (
     <>
       <PanelSectionRow>
+        <ToggleField
+          label="Show compatible only"
+          description={
+            compatLoading
+              ? "Scanning games for DLSS / FSR / XeSS..."
+              : "Filter to games detected or listed as OptiScaler compatible."
+          }
+          checked={showCompatibleOnly}
+          onChange={setShowCompatibleOnly}
+        />
+      </PanelSectionRow>
+
+      <PanelSectionRow>
         <DropdownItem
           layout="below"
           label="Steam game"
           menuLabel="Select a Steam game"
           strDefaultLabel={gamesLoading ? "Loading games..." : "Choose a game"}
-          disabled={gamesLoading || games.length === 0}
+          disabled={gamesLoading || visibleGames.length === 0}
           selectedOption={selectedAppId}
-          rgOptions={games.map((g) => ({
-            data: g.appid,
-            label: g.install_found === false ? `${g.name} (not installed)` : g.name,
-          }))}
+          rgOptions={visibleGames.map((g) => {
+            const compat = compatMap[g.appid]?.compat;
+            const badge = compat ? ` - ${COMPAT_META[compat].short}` : "";
+            const base = g.install_found === false ? `${g.name} (not installed)` : g.name;
+            return { data: g.appid, label: `${base}${badge}` };
+          })}
           onChange={(option) => {
             const next = String(option.data);
             lastSelectedAppId = next;
@@ -257,6 +352,44 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
 
       {selectedGame && (
         <>
+          <PanelSectionRow>
+            <Field
+              {...focusableFieldProps}
+              label="OptiScaler compatibility"
+              description={
+                selectedCompat && selectedCompat.sources.length > 0
+                  ? `Source: ${selectedCompat.sources.join(", ")}${
+                      selectedCompat.upscalers.length
+                        ? ` (${selectedCompat.upscalers.join(", ").toUpperCase()})`
+                        : ""
+                    }`
+                  : "No DLSS/FSR/XeSS detected and not on the curated list."
+              }
+            >
+              {selectedCompat ? (
+                <span style={{ color: COMPAT_META[selectedCompat.compat].color, fontWeight: 600 }}>
+                  {COMPAT_META[selectedCompat.compat].label}
+                </span>
+              ) : compatLoading ? (
+                "Checking..."
+              ) : (
+                "Unknown"
+              )}
+            </Field>
+          </PanelSectionRow>
+
+          <PanelSectionRow>
+            <DropdownItem
+              layout="below"
+              label="Compatibility override"
+              menuLabel="Compatibility override"
+              selectedOption={selectedCompat?.override || "clear"}
+              disabled={overrideBusy || compatLoading}
+              rgOptions={COMPAT_OVERRIDE_OPTIONS.map((o) => ({ data: o.data, label: o.label }))}
+              onChange={(option) => void handleSetOverride(String(option.data))}
+            />
+          </PanelSectionRow>
+
           <PanelSectionRow>
             <Field {...focusableFieldProps} label="Patch status">
               {statusDisplay.color ? (
