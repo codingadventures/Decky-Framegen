@@ -113,6 +113,33 @@ Dx12Upscaler=fsr31 ~/fgmod/fgmod %command%
 - **Supporting Libraries**: All required DX12/Vulkan libraries (libxess.dll, amd_fidelityfx, etc.)
 
 
+## Building From Source
+
+This plugin is built with the [Decky CLI](https://github.com/SteamDeckHomebrew/cli), which runs the frontend `rollup` build, downloads the bundled `remote_binary` assets (OptiScaler archive + FSR4 DLLs) declared in `package.json`, and packages everything into an installable zip.
+
+### In CI (recommended)
+
+A GitHub Actions workflow at [.github/workflows/build.yml](.github/workflows/build.yml) builds the plugin on every push/PR and uploads the zip as a build artifact. Pushing a `v*` tag additionally publishes a GitHub Release with the zip attached:
+
+```bash
+git tag v0.16.0
+git push origin v0.16.0
+```
+
+### Locally
+
+Requires Docker (the CLI builds inside a Linux container) and the Decky CLI binary in `./cli/decky`:
+
+```bash
+# One-time: fetch dependencies + the Decky CLI (interactive)
+.vscode/setup.sh
+
+# Build -> produces out/<plugin-name>.zip
+just build        # or: .vscode/build.sh
+```
+
+Then install the resulting zip via Decky Loader's "Install from ZIP" option in developer settings. Note: a full build cannot run on machines without Docker (e.g. stock macOS without Docker Desktop) - use the CI workflow instead.
+
 ## Credits
 
 ### Core Technologies
