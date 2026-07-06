@@ -1,5 +1,6 @@
 import decky
 import os
+import sys
 import subprocess
 import json
 import shutil
@@ -13,6 +14,16 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+
+# Decky's sandboxed plugin loader does not put the plugin root directory on
+# sys.path (only py_modules), so a bare `from compat_logic import ...` fails at
+# load time with ModuleNotFoundError. Add both this file's directory and its
+# py_modules subdir to sys.path so the helper module resolves no matter where it
+# ends up in the bundle.
+_PLUGIN_DIR = os.path.dirname(os.path.abspath(__file__))
+for _candidate in (_PLUGIN_DIR, os.path.join(_PLUGIN_DIR, "py_modules")):
+    if _candidate not in sys.path:
+        sys.path.insert(0, _candidate)
 
 from compat_logic import (
     classify_amd_gpu,
@@ -264,6 +275,7 @@ CURATED_COMPAT_URL = (
     "https://raw.githubusercontent.com/wiki/optiscaler/OptiScaler/Compatibility-List.md"
 )
 CURATED_CACHE_FILENAME = "compat-curated-cache.json"
+BUNDLED_CURATED_FILENAME = "Compatibility-List.md"
 SCAN_CACHE_FILENAME = "compat-scan-cache.json"
 OVERRIDES_FILENAME = "compat-overrides.json"
 CURATED_CACHE_TTL_SECONDS = 24 * 60 * 60  # refresh at most once a day
@@ -1620,10 +1632,15 @@ class Plugin:
             games = []
             for game in self._find_installed_games():
                 install_root = Path(game["install_path"])
+                # Steam keeps appmanifest files around for games that are no
+                # longer on disk; skip those so the list only shows games that
+                # are actually installed and patchable.
+                if not install_root.exists():
+                    continue
                 games.append({
                     "appid": str(game["appid"]),
                     "name": game["name"],
-                    "install_found": install_root.exists(),
+                    "install_found": True,
                 })
             return {"status": "success", "games": games}
         except Exception as e:
@@ -1954,16 +1971,49 @@ class Plugin:
     def _parse_curated_markdown(self, raw: str) -> set[str]:
         return parse_curated_markdown(raw)
 
+    def _resolve_ca_bundle(self) -> str | None:
+        """Find a usable CA bundle. Decky's Python often can't locate one on
+        SteamOS (its compiled-in OpenSSL path doesn't match the distro), which
+        is what causes CERTIFICATE_VERIFY_FAILED. Prefer certifi if bundled,
+        then the well-known system locations (SteamOS/Arch, Fedora, BSD)."""
+        try:
+            import certifi  # optional; only present if bundled in py_modules
+
+            path = certifi.where()
+            if path and os.path.exists(path):
+                return path
+        except Exception:
+            pass
+        for candidate in (
+            os.environ.get("SSL_CERT_FILE"),
+            "/etc/ssl/certs/ca-certificates.crt",  # SteamOS / Arch / Debian
+            "/etc/pki/tls/certs/ca-bundle.crt",    # Fedora / RHEL
+            "/etc/ssl/cert.pem",                    # BSD / some minimal images
+        ):
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return None
+
+    def _make_ssl_context(self) -> ssl.SSLContext:
+        ca_bundle = self._resolve_ca_bundle()
+        if ca_bundle:
+            try:
+                return ssl.create_default_context(cafile=ca_bundle)
+            except Exception as exc:
+                decky.logger.debug(f"[Framegen] failed to load CA bundle {ca_bundle}: {exc}")
+        return ssl.create_default_context()
+
     def _fetch_curated_markdown(self) -> str:
-        """Fetch the curated compat markdown, retrying with a relaxed SSL
-        context if the default one fails to verify. SteamOS's bundled Python
-        can ship an incomplete CA bundle, which otherwise fails every call
-        silently and leaves every game looking "Unknown"."""
+        """Fetch the curated compat markdown. Uses a verified TLS context backed
+        by the system CA bundle; only if verification still fails does it retry
+        with an unverified context as a last resort (SteamOS's bundled Python
+        can otherwise fail every call and leave every game looking "Unknown")."""
         request = urllib.request.Request(
             CURATED_COMPAT_URL, headers={"User-Agent": "Decky-Framegen"}
         )
         try:
-            with urllib.request.urlopen(request, timeout=10) as response:
+            context = self._make_ssl_context()
+            with urllib.request.urlopen(request, timeout=10, context=context) as response:
                 return response.read().decode("utf-8", errors="replace")
         except urllib.error.URLError as exc:
             reason = getattr(exc, "reason", exc)
@@ -1971,11 +2021,37 @@ class Plugin:
                 raise
             decky.logger.warning(
                 f"[Framegen] curated compat TLS verification failed ({reason}); "
-                "retrying with an unverified context. Consider updating system CA certificates."
+                "no usable CA bundle found, retrying with an unverified context. "
+                "Consider updating system CA certificates."
             )
             unverified_context = ssl._create_unverified_context()
             with urllib.request.urlopen(request, timeout=10, context=unverified_context) as response:
                 return response.read().decode("utf-8", errors="replace")
+
+    def _bundled_curated_path(self) -> Path | None:
+        """Locate the curated list snapshot bundled with the plugin. On device
+        the contents of defaults/ are extracted next to main.py; in the repo it
+        lives under defaults/."""
+        for candidate in (
+            Path(_PLUGIN_DIR) / BUNDLED_CURATED_FILENAME,
+            Path(_PLUGIN_DIR) / "defaults" / BUNDLED_CURATED_FILENAME,
+        ):
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _load_bundled_curated(self) -> dict:
+        path = self._bundled_curated_path()
+        if not path:
+            return {}
+        try:
+            raw = path.read_text(encoding="utf-8", errors="replace")
+            names = self._parse_curated_markdown(raw)
+            if names:
+                return {"fetched_at": 0, "names": sorted(names), "count": len(names), "bundled": True}
+        except Exception as exc:
+            decky.logger.warning(f"[Framegen] bundled curated list read failed: {exc}")
+        return {}
 
     def _load_curated_compat(self, force_refresh: bool = False) -> dict:
         cache_path = self._fgmod_data_dir() / CURATED_CACHE_FILENAME
@@ -1999,7 +2075,20 @@ class Plugin:
             decky.logger.warning(f"[Framegen] curated compat fetch failed: {exc}")
             cached = dict(cached)
             cached["last_error"] = str(exc)
-        return cached if cached.get("names") else {"fetched_at": 0, "names": [], "count": 0, "last_error": cached.get("last_error")}
+        if cached.get("names"):
+            return cached
+        # Network fetch failed and there's no usable cache: fall back to the
+        # snapshot bundled with the plugin so games can still be Verified while
+        # offline or rate-limited (HTTP 429).
+        bundled = self._load_bundled_curated()
+        if bundled.get("names"):
+            decky.logger.info(
+                f"[Framegen] using bundled curated list ({bundled['count']} entries) as fallback"
+            )
+            if cached.get("last_error"):
+                bundled["last_error"] = cached["last_error"]
+            return bundled
+        return {"fetched_at": 0, "names": [], "count": 0, "last_error": cached.get("last_error")}
 
     def _load_overrides(self) -> dict:
         return self._read_json_file(self._fgmod_data_dir() / OVERRIDES_FILENAME)
@@ -2040,6 +2129,8 @@ class Plugin:
                 name = game["name"]
                 install_path = Path(game["install_path"]) if game.get("install_path") else None
                 install_found = bool(install_path and install_path.exists())
+                if not install_found:
+                    continue
 
                 upscalers: list[str] = []
                 if install_found:
@@ -2099,6 +2190,7 @@ class Plugin:
                 "games": results,
                 "curated_count": curated.get("count", len(curated_names)),
                 "curated_available": bool(curated_names),
+                "curated_source": "bundled" if curated.get("bundled") else ("live" if curated_names else "none"),
                 "curated_error": curated.get("last_error"),
             }
         except Exception as exc:

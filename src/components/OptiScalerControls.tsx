@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { DropdownItem, Field, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
-import { runInstallFGMod, runUninstallFGMod, setDefaultFsr4Variant, detectGpu, getDebugLogging, setDebugLogging } from "../api";
+import { runInstallFGMod, runUninstallFGMod, setDefaultFsr4Variant, detectGpu, getDebugLogging, setDebugLogging as apiSetDebugLogging } from "../api";
 import { OperationResult } from "./ResultDisplay";
 import { createAutoCleanupTimer } from "../utils";
 import { TIMEOUTS, PROXY_DLL_OPTIONS, DEFAULT_PROXY_DLL, FSR4_VARIANT_OPTIONS, DEFAULT_FSR4_VARIANT } from "../utils/constants";
@@ -174,7 +174,7 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
     setDebugLogging(enabled);
     setDebugLoggingBusy(true);
     try {
-      const result = await setDebugLogging(enabled);
+      const result = await apiSetDebugLogging(enabled);
       if (result.status !== "success") throw new Error(result.message || "Failed to update debug logging.");
       setDebugLogging(Boolean(result.enabled));
       if (result.log_path) setDebugLogPath(result.log_path);

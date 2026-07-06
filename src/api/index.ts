@@ -76,6 +76,7 @@ export const listGamesCompatibility = callable<
     games: GameCompat[];
     curated_count?: number;
     curated_available?: boolean;
+    curated_source?: "live" | "bundled" | "none";
     curated_error?: string | null;
   }
 >("list_games_compatibility");

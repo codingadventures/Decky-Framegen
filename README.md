@@ -19,7 +19,7 @@ This plugin uses OptiScaler to replace DLSS calls with FSR3/FSR3.1, giving you:
 - **Smart Installation**: Handles all required dependencies and library files
 - **Game Patching**: Easy copy-paste launch commands for enabling/disabling the mod per game
 - **GPU-Aware Defaults**: Detects your GPU and recommends the matching FSR4 runtime (RDNA4 native vs the RDNA2/3/3.5 INT8 override)
-- **Compatibility Marking**: Flags which installed games are OptiScaler compatible, with a "show compatible only" filter and a per-game manual override
+- **Compatibility Marking**: Flags which installed games are OptiScaler compatible, with independent **Verified** / **Compatible** filters and a per-game manual override
 - **OptiScaler Wiki**: Direct access to OptiScaler documentation and settings via a webpage launch button right inside the plugin.
 
 ### Supported Devices
@@ -41,7 +41,9 @@ OptiScaler works by hooking a game's existing upscaler, so it mainly benefits ti
 - **Unknown**: no signal either way. Not shown as a badge in the game list to keep it readable; visible in the compatibility detail field for the selected game.
 - **Not compatible**: you manually marked it as such via the override. Also hidden from the list/badges.
 
-Manually marking a game **Compatible** or **Not compatible** always takes priority over the automatic detection. Use the **Show compatible only** toggle to filter the game dropdown to Verified/Compatible titles, and the **Compatibility override** dropdown to force a per-game result. Detection is best-effort and cached; the curated list is fetched once a day and everything still works offline via the local scan. If the curated list can't be fetched (for example due to an outdated CA certificate bundle on some SteamOS images), games can still be marked **Compatible** by the local scan, and the toggle description will say so.
+Only games that are actually installed on disk are listed (Steam's leftover `appmanifest` entries for removed games are skipped). Manually marking a game **Compatible** or **Not compatible** always takes priority over the automatic detection. Use the **Filter: Verified** and **Filter: Compatible** toggles to narrow the game dropdown (with neither enabled, every installed game is shown), and the **Compatibility override** dropdown to force a per-game result.
+
+Detection is best-effort and cached. The curated list is fetched over a verified TLS connection (using the system CA bundle) at most once a day; a snapshot of the list also **ships with the plugin**, so Verified marking keeps working offline or when GitHub rate-limits the request (HTTP 429). If the live list can't be fetched, the plugin transparently falls back to the bundled snapshot and the filter description notes it. Even with no curated list at all, games can still be marked **Compatible** by the local DLL scan.
 
 > **Note:** The game list and compatibility marking cover your **Steam library** only (they read Steam's `appmanifest` files). Games installed through Heroic (Epic/GOG/Amazon) or Lutris won't appear in the dropdown, but you can still patch them manually with the `~/fgmod/fgmod %command%` wrapper (the launcher script includes Lutris resolution).
 

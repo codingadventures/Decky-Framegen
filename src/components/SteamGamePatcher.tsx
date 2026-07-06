@@ -109,7 +109,9 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
   const [compatMap, setCompatMap] = useState<Record<string, GameCompat>>({});
   const [compatLoading, setCompatLoading] = useState(true);
   const [curatedError, setCuratedError] = useState<string | null>(null);
-  const [showCompatibleOnly, setShowCompatibleOnly] = useState(false);
+  const [curatedBundled, setCuratedBundled] = useState(false);
+  const [filterVerified, setFilterVerified] = useState(false);
+  const [filterCompatible, setFilterCompatible] = useState(false);
   const [overrideBusy, setOverrideBusy] = useState(false);
 
   // ── Data loaders ───────────────────────────────────────────────────────────
@@ -123,6 +125,7 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
         for (const entry of result.games) map[entry.appid] = entry;
         setCompatMap(map);
         setCuratedError(result.curated_available ? null : result.curated_error || null);
+        setCuratedBundled(result.curated_source === "bundled");
       }
     } catch (err) {
       // non-fatal: compatibility hints are best-effort
@@ -144,9 +147,10 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
         setSelectedAppId("");
         return;
       }
+      // Default to the "— Select a game —" placeholder rather than auto-picking
+      // the first game, so nothing is forced into the filtered list.
       setSelectedAppId((current) => {
-        const valid =
-          current && gameList.some((g) => g.appid === current) ? current : gameList[0].appid;
+        const valid = current && gameList.some((g) => g.appid === current) ? current : "";
         lastSelectedAppId = valid;
         return valid;
       });
@@ -203,13 +207,17 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
   );
 
   const visibleGames = useMemo(() => {
-    if (!showCompatibleOnly) return games;
+    // No filter selected → show every installed game.
+    if (!filterVerified && !filterCompatible) return games;
     return games.filter((g) => {
       const compat = compatMap[g.appid]?.compat;
       // Always keep the current selection visible so it doesn't vanish.
-      return g.appid === selectedAppId || (compat && BADGE_WORTHY_COMPAT.has(compat));
+      if (g.appid === selectedAppId) return true;
+      if (filterVerified && compat === "verified") return true;
+      if (filterCompatible && compat === "compatible") return true;
+      return false;
     });
-  }, [games, compatMap, showCompatibleOnly, selectedAppId]);
+  }, [games, compatMap, filterVerified, filterCompatible, selectedAppId]);
 
   const selectedVariantLabel = useMemo(
     () => FSR4_VARIANT_OPTIONS.find((option) => option.value === fsr4Variant)?.label ?? fsr4Variant,
@@ -322,16 +330,31 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
     <>
       <PanelSectionRow>
         <ToggleField
-          label="Show compatible only"
+          label="Filter: Verified"
+          description={
+            compatLoading
+              ? "Loading curated compatibility list..."
+              : curatedError
+              ? `On the OptiScaler curated list. Curated list unavailable: ${curatedError}`
+              : curatedBundled
+              ? "On the OptiScaler curated list (using bundled snapshot; live list unavailable)."
+              : "Show only games on the OptiScaler curated list."
+          }
+          checked={filterVerified}
+          onChange={setFilterVerified}
+        />
+      </PanelSectionRow>
+
+      <PanelSectionRow>
+        <ToggleField
+          label="Filter: Compatible"
           description={
             compatLoading
               ? "Scanning games for DLSS / FSR / XeSS..."
-              : curatedError
-              ? `Filter to Verified/Compatible games. Curated list unavailable: ${curatedError}`
-              : "Filter to games Verified via the curated list or detected as Compatible."
+              : "Show only games with DLSS / FSR / XeSS files detected on disk."
           }
-          checked={showCompatibleOnly}
-          onChange={setShowCompatibleOnly}
+          checked={filterCompatible}
+          onChange={setFilterCompatible}
         />
       </PanelSectionRow>
 
@@ -340,15 +363,19 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
           layout="below"
           label="Steam game"
           menuLabel="Select a Steam game"
-          strDefaultLabel={gamesLoading ? "Loading games..." : "Choose a game"}
-          disabled={gamesLoading || visibleGames.length === 0}
+          strDefaultLabel={gamesLoading ? "Loading games..." : "— Select a game —"}
+          disabled={gamesLoading}
           selectedOption={selectedAppId}
-          rgOptions={visibleGames.map((g) => {
-            const compat = compatMap[g.appid]?.compat;
-            const badge = compat && BADGE_WORTHY_COMPAT.has(compat) ? ` - ${COMPAT_META[compat].short}` : "";
-            const base = g.install_found === false ? `${g.name} (not installed)` : g.name;
-            return { data: g.appid, label: `${base}${badge}` };
-          })}
+          rgOptions={[
+            // Always-present placeholder so the dropdown has a stable, unfiltered
+            // first entry even when the Verified/Compatible filters hide games.
+            { data: "", label: "— Select a game —" },
+            ...visibleGames.map((g) => {
+              const compat = compatMap[g.appid]?.compat;
+              const badge = compat && BADGE_WORTHY_COMPAT.has(compat) ? ` - ${COMPAT_META[compat].short}` : "";
+              return { data: g.appid, label: `${g.name}${badge}` };
+            }),
+          ]}
           onChange={(option) => {
             const next = String(option.data);
             lastSelectedAppId = next;
