@@ -1,6 +1,9 @@
 default:
     echo "Available recipes: build, test, clean"
 
+test:
+    python3 -m unittest discover -s tests -v
+
 build:
     sudo rm -rf node_modules && .vscode/build.sh
 

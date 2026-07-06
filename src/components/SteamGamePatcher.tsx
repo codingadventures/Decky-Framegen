@@ -18,11 +18,15 @@ const COMPAT_META: Record<
   GameCompat["compat"],
   { label: string; short: string; color: string }
 > = {
-  yes: { label: "Compatible", short: "Compatible", color: "#3fb950" },
-  likely: { label: "Likely compatible", short: "Likely", color: "#58a6ff" },
+  verified: { label: "Verified (curated list)", short: "Verified", color: "#3fb950" },
+  compatible: { label: "Compatible (files detected)", short: "Compatible", color: "#58a6ff" },
   unknown: { label: "Unknown", short: "Unknown", color: "#ffd866" },
-  no: { label: "Marked not compatible", short: "Not compatible", color: "#f85149" },
+  incompatible: { label: "Marked not compatible", short: "Not compatible", color: "#f85149" },
 };
+
+// Only these states are worth a badge in the (already busy) game dropdown -
+// "unknown"/"incompatible" stay unlabeled there to avoid noise.
+const BADGE_WORTHY_COMPAT = new Set<GameCompat["compat"]>(["verified", "compatible"]);
 
 const COMPAT_OVERRIDE_OPTIONS = [
   { data: "clear", label: "Auto-detect" },
@@ -104,6 +108,7 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
   const [resultMessage, setResultMessage] = useState<string>("");
   const [compatMap, setCompatMap] = useState<Record<string, GameCompat>>({});
   const [compatLoading, setCompatLoading] = useState(true);
+  const [curatedError, setCuratedError] = useState<string | null>(null);
   const [showCompatibleOnly, setShowCompatibleOnly] = useState(false);
   const [overrideBusy, setOverrideBusy] = useState(false);
 
@@ -117,6 +122,7 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
         const map: Record<string, GameCompat> = {};
         for (const entry of result.games) map[entry.appid] = entry;
         setCompatMap(map);
+        setCuratedError(result.curated_available ? null : result.curated_error || null);
       }
     } catch (err) {
       // non-fatal: compatibility hints are best-effort
@@ -201,7 +207,7 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
     return games.filter((g) => {
       const compat = compatMap[g.appid]?.compat;
       // Always keep the current selection visible so it doesn't vanish.
-      return g.appid === selectedAppId || compat === "yes" || compat === "likely";
+      return g.appid === selectedAppId || (compat && BADGE_WORTHY_COMPAT.has(compat));
     });
   }, [games, compatMap, showCompatibleOnly, selectedAppId]);
 
@@ -320,7 +326,9 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
           description={
             compatLoading
               ? "Scanning games for DLSS / FSR / XeSS..."
-              : "Filter to games detected or listed as OptiScaler compatible."
+              : curatedError
+              ? `Filter to Verified/Compatible games. Curated list unavailable: ${curatedError}`
+              : "Filter to games Verified via the curated list or detected as Compatible."
           }
           checked={showCompatibleOnly}
           onChange={setShowCompatibleOnly}
@@ -337,7 +345,7 @@ export function SteamGamePatcher({ dllName, fsr4Variant }: SteamGamePatcherProps
           selectedOption={selectedAppId}
           rgOptions={visibleGames.map((g) => {
             const compat = compatMap[g.appid]?.compat;
-            const badge = compat ? ` - ${COMPAT_META[compat].short}` : "";
+            const badge = compat && BADGE_WORTHY_COMPAT.has(compat) ? ` - ${COMPAT_META[compat].short}` : "";
             const base = g.install_found === false ? `${g.name} (not installed)` : g.name;
             return { data: g.appid, label: `${base}${badge}` };
           })}

@@ -62,7 +62,7 @@ export type GameCompat = {
   appid: string;
   name: string;
   install_found: boolean;
-  compat: "yes" | "likely" | "unknown" | "no";
+  compat: "verified" | "compatible" | "unknown" | "incompatible";
   sources: string[];
   upscalers: string[];
   override?: string | null;
@@ -76,6 +76,7 @@ export const listGamesCompatibility = callable<
     games: GameCompat[];
     curated_count?: number;
     curated_available?: boolean;
+    curated_error?: string | null;
   }
 >("list_games_compatibility");
 
@@ -85,6 +86,16 @@ export const setGameCompatOverride = callable<
 >("set_game_compat_override");
 
 export const logError = callable<[string], void>("log_error");
+
+export const getDebugLogging = callable<
+  [],
+  { status: string; message?: string; enabled: boolean; log_path?: string }
+>("get_debug_logging");
+
+export const setDebugLogging = callable<
+  [enabled: boolean],
+  { status: string; message?: string; enabled: boolean; log_path?: string }
+>("set_debug_logging");
 
 export const getPathDefaults = callable<
   [],

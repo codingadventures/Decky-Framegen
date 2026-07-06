@@ -36,12 +36,12 @@ You can always override the runtime manually from the "Default FSR4 runtime" dro
 ### Which Games Are Compatible?
 
 OptiScaler works by hooking a game's existing upscaler, so it mainly benefits titles that already expose **DLSS 2+, FSR2+, or XeSS** (games with no upscaler at all only have the experimental OptiFG path). The plugin marks each installed game as:
-- **Compatible**: an upscaler DLL (`nvngx_dlss.dll`, `libxess.dll`, FSR FidelityFX libraries) was found in the game folder, or you marked it compatible.
-- **Likely**: the game appears on the community [OptiScaler compatibility list](https://github.com/optiscaler/OptiScaler/wiki/Compatibility-List) by name (useful for games that statically link FSR and have no detectable DLL).
-- **Unknown**: no signal either way.
-- **Not compatible**: you manually marked it as such.
+- **Verified**: the game appears on the community [OptiScaler compatibility list](https://github.com/optiscaler/OptiScaler/wiki/Compatibility-List) by name - the strongest signal, since it reflects real community testing (also covers games that statically link FSR and have no detectable DLL).
+- **Compatible**: an upscaler DLL (`nvngx_dlss.dll`, `libxess.dll`, FSR FidelityFX libraries) was found in the game folder - a good heuristic, but not community-verified.
+- **Unknown**: no signal either way. Not shown as a badge in the game list to keep it readable; visible in the compatibility detail field for the selected game.
+- **Not compatible**: you manually marked it as such via the override. Also hidden from the list/badges.
 
-Use the **Show compatible only** toggle to filter the game dropdown, and the **Compatibility override** dropdown to force a per-game result. Detection is best-effort and cached; the curated list is fetched once a day and everything still works offline via the local scan.
+Manually marking a game **Compatible** or **Not compatible** always takes priority over the automatic detection. Use the **Show compatible only** toggle to filter the game dropdown to Verified/Compatible titles, and the **Compatibility override** dropdown to force a per-game result. Detection is best-effort and cached; the curated list is fetched once a day and everything still works offline via the local scan. If the curated list can't be fetched (for example due to an outdated CA certificate bundle on some SteamOS images), games can still be marked **Compatible** by the local scan, and the toggle description will say so.
 
 > **Note:** The game list and compatibility marking cover your **Steam library** only (they read Steam's `appmanifest` files). Games installed through Heroic (Epic/GOG/Amazon) or Lutris won't appear in the dropdown, but you can still patch them manually with the `~/fgmod/fgmod %command%` wrapper (the launcher script includes Lutris resolution).
 
@@ -139,6 +139,89 @@ just build        # or: .vscode/build.sh
 ```
 
 Then install the resulting zip via Decky Loader's "Install from ZIP" option in developer settings. Note: a full build cannot run on machines without Docker (e.g. stock macOS without Docker Desktop) - use the CI workflow instead.
+
+### Unit tests
+
+Compatibility parsing/classification logic lives in [`compat_logic.py`](compat_logic.py) and is tested against a real snapshot of the OptiScaler wiki list in [`tests/fixtures/Compatibility-List.md`](tests/fixtures/Compatibility-List.md):
+
+```bash
+python3 -m unittest discover -s tests -v
+# or
+just test
+```
+
+Refresh the fixture when the wiki list changes materially (see [`tests/fixtures/README.md`](tests/fixtures/README.md)).
+
+## Debugging on a running device
+
+Yes — the plugin logs via `decky.logger` to a **file only** (not your screen/TTY in Game Mode). You can tail that file over SSH while using the plugin on your Deck / Legion Go.
+
+### Verbose debug logging toggle
+
+By default the plugin only writes high-signal lines (`info`/`warning`/`error`): install/patch success, failures, etc.
+
+Enable **Verbose debug logging** at the bottom of the plugin UI to also record detailed diagnostics (`debug` level), including:
+
+- GPU detection details
+- Compatibility scan summaries (`compat summary: verified=...`)
+- Per-file patch/unpatch steps
+- Curated list fetch/SSL retry details
+
+The setting is stored under `~/homebrew/settings/Decky-Framegen/debug-logging.json` and takes effect immediately (no plugin reload required).
+
+### Plugin log (Python backend + frontend errors)
+
+Decky writes plugin logs under your homebrew folder. For this plugin the main file is typically:
+
+```text
+~/homebrew/logs/Decky-Framegen/plugin.log
+```
+
+Tail it live over SSH (replace user/host as needed):
+
+```bash
+ssh deck@YOUR_DEVICE 'tail -f ~/homebrew/logs/Decky-Framegen/plugin.log'
+```
+
+Useful lines to grep for:
+
+```bash
+ssh deck@YOUR_DEVICE "grep '\\[Framegen\\]' ~/homebrew/logs/Decky-Framegen/plugin.log | tail -50"
+```
+
+What you'll see (with **Verbose debug logging** enabled):
+
+- `[Framegen] detect_gpu: ...` — GPU detection + recommended FSR4 variant
+- `[Framegen] compat summary: verified=... compatible=... curated_error=...` — result of the compatibility scan
+- `[Framegen] curated compat fetch failed: ...` or TLS retry warnings — explains why everything looked "Unknown"
+- `[Framegen] patch_game / unpatch_game ...` — per-game patch actions (detailed target lines are debug-only)
+- `FRONTEND: ...` — errors forwarded from the React UI via `logError()`
+
+With verbose logging **off**, you still get patch/unpatch success lines and all warnings/errors.
+
+Decky Loader itself also logs to `journalctl`; if the plugin log is empty, check:
+
+```bash
+ssh deck@YOUR_DEVICE 'journalctl -u plugin_loader -f'
+```
+
+### fgmod launcher logs (when a game starts)
+
+If you patch via `~/fgmod/fgmod %command%`, the wrapper also logs to the system journal and a temp file:
+
+```bash
+ssh deck@YOUR_DEVICE 'journalctl -t fgmod -f'
+ssh deck@YOUR_DEVICE 'tail -f /tmp/fgmod-install.log'
+```
+
+### Cached compatibility data on device
+
+After a scan, inspect what the plugin stored locally:
+
+```bash
+ssh deck@YOUR_DEVICE 'ls -la ~/fgmod/compat-*'
+ssh deck@YOUR_DEVICE 'python3 -m json.tool ~/fgmod/compat-curated-cache.json | head'
+```
 
 ## Credits
 

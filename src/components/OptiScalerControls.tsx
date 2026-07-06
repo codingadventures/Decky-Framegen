@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import { DropdownItem, Field, PanelSection, PanelSectionRow, ToggleField } from "@decky/ui";
-import { runInstallFGMod, runUninstallFGMod, setDefaultFsr4Variant, detectGpu } from "../api";
+import { runInstallFGMod, runUninstallFGMod, setDefaultFsr4Variant, detectGpu, getDebugLogging, setDebugLogging } from "../api";
 import { OperationResult } from "./ResultDisplay";
 import { createAutoCleanupTimer } from "../utils";
 import { TIMEOUTS, PROXY_DLL_OPTIONS, DEFAULT_PROXY_DLL, FSR4_VARIANT_OPTIONS, DEFAULT_FSR4_VARIANT } from "../utils/constants";
@@ -48,6 +48,23 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
   const [fsr4VariantTouched, setFsr4VariantTouched] = useState(false);
   const [switchingVariant, setSwitchingVariant] = useState(false);
   const [gpuInfo, setGpuInfo] = useState<GpuInfo | null>(null);
+  const [debugLogging, setDebugLogging] = useState(false);
+  const [debugLogPath, setDebugLogPath] = useState("");
+  const [debugLoggingBusy, setDebugLoggingBusy] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getDebugLogging()
+      .then((result) => {
+        if (cancelled || result?.status !== "success") return;
+        setDebugLogging(Boolean(result.enabled));
+        if (result.log_path) setDebugLogPath(result.log_path);
+      })
+      .catch((e) => console.error(e));
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -151,6 +168,23 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
   };
 
   const installedVariantLabel = fgmodInfo?.selected_fsr4_variant_label || FSR4_VARIANT_OPTIONS.find((option) => option.value === fsr4Variant)?.label;
+
+  const handleDebugLoggingChange = async (enabled: boolean) => {
+    const previous = debugLogging;
+    setDebugLogging(enabled);
+    setDebugLoggingBusy(true);
+    try {
+      const result = await setDebugLogging(enabled);
+      if (result.status !== "success") throw new Error(result.message || "Failed to update debug logging.");
+      setDebugLogging(Boolean(result.enabled));
+      if (result.log_path) setDebugLogPath(result.log_path);
+    } catch (error) {
+      console.error(error);
+      setDebugLogging(previous);
+    } finally {
+      setDebugLoggingBusy(false);
+    }
+  };
 
   return (
     <PanelSection>
@@ -257,6 +291,20 @@ export function OptiScalerControls({ pathExists, setPathExists, fgmodInfo }: Opt
         <InstructionCard pathExists={pathExists} />
       )}
       <OptiScalerWiki pathExists={pathExists} />
+
+      <PanelSectionRow>
+        <ToggleField
+          label="Verbose debug logging"
+          description={
+            debugLogPath
+              ? `Off by default. When enabled, detailed diagnostics are written to ${debugLogPath}`
+              : "Off by default. When enabled, detailed diagnostics are written to the plugin log file."
+          }
+          checked={debugLogging}
+          disabled={debugLoggingBusy}
+          onChange={(enabled) => void handleDebugLoggingChange(enabled)}
+        />
+      </PanelSectionRow>
       
       <UninstallButton 
         pathExists={pathExists}

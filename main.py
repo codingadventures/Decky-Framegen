@@ -6,11 +6,21 @@ import shutil
 import re
 import filecmp
 import hashlib
+import logging
 import time
+import ssl
 import urllib.request
 import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
+
+from compat_logic import (
+    classify_amd_gpu,
+    classify_game_compat,
+    is_curated_match,
+    normalize_game_name,
+    parse_curated_markdown,
+)
 
 OPTISCALER_ARCHIVE_ASSET = {
     "name": "Optiscaler_0.9.3-final.20260618.7z",
@@ -271,13 +281,54 @@ UPSCALER_SIGNATURES = {
     ],
 }
 VALID_COMPAT_OVERRIDES = {"compatible", "incompatible", "clear"}
+DEBUG_SETTINGS_FILENAME = "debug-logging.json"
 
 class Plugin:
     async def _main(self):
+        self._apply_log_level(self._load_debug_logging())
         decky.logger.info("Framegen plugin loaded")
 
     async def _unload(self):
         decky.logger.info("Framegen plugin unloaded.")
+
+    def _debug_settings_path(self) -> Path:
+        try:
+            settings_dir = Path(decky.DECKY_PLUGIN_SETTINGS_DIR)
+        except (TypeError, AttributeError):
+            settings_dir = Path(decky.HOME) / "homebrew" / "settings" / "Decky-Framegen"
+        settings_dir.mkdir(parents=True, exist_ok=True)
+        return settings_dir / DEBUG_SETTINGS_FILENAME
+
+    def _load_debug_logging(self) -> bool:
+        return bool(self._read_json_file(self._debug_settings_path()).get("enabled"))
+
+    def _save_debug_logging(self, enabled: bool) -> None:
+        self._write_json_file(self._debug_settings_path(), {"enabled": bool(enabled)})
+
+    def _apply_log_level(self, enabled: bool) -> None:
+        decky.logger.setLevel(logging.DEBUG if enabled else logging.INFO)
+
+    async def get_debug_logging(self) -> dict:
+        enabled = self._load_debug_logging()
+        self._apply_log_level(enabled)
+        try:
+            log_path = str(getattr(decky, "DECKY_PLUGIN_LOG", ""))
+        except (TypeError, AttributeError):
+            log_path = ""
+        return {"status": "success", "enabled": enabled, "log_path": log_path}
+
+    async def set_debug_logging(self, enabled: bool) -> dict:
+        enabled = bool(enabled)
+        self._save_debug_logging(enabled)
+        self._apply_log_level(enabled)
+        decky.logger.info(
+            f"[Framegen] verbose debug logging {'enabled' if enabled else 'disabled'}"
+        )
+        try:
+            log_path = str(getattr(decky, "DECKY_PLUGIN_LOG", ""))
+        except (TypeError, AttributeError):
+            log_path = ""
+        return {"status": "success", "enabled": enabled, "log_path": log_path}
         
     def _create_renamed_copies(self, source_file, renames_dir):
         """Create renamed copies of the OptiScaler.dll file"""
@@ -298,7 +349,7 @@ class Plugin:
                 for rename_file in rename_files:
                     dest_file = renames_dir / rename_file
                     shutil.copy2(source_file, dest_file)
-                    decky.logger.info(f"Created renamed copy: {dest_file}")
+                    decky.logger.debug(f"Created renamed copy: {dest_file}")
                 return True
             else:
                 decky.logger.error(f"Source file {source_file} does not exist")
@@ -317,7 +368,7 @@ class Plugin:
             if fgmod_script_src.exists():
                 shutil.copy2(fgmod_script_src, fgmod_script_dest)
                 fgmod_script_dest.chmod(0o755)
-                decky.logger.info(f"Copied fgmod script to {fgmod_script_dest}")
+                decky.logger.debug(f"Copied fgmod script to {fgmod_script_dest}")
             
             # Copy uninstaller script
             uninstaller_src = assets_dir / "fgmod-uninstaller.sh"
@@ -325,7 +376,7 @@ class Plugin:
             if uninstaller_src.exists():
                 shutil.copy2(uninstaller_src, uninstaller_dest)
                 uninstaller_dest.chmod(0o755)
-                decky.logger.info(f"Copied uninstaller script to {uninstaller_dest}")
+                decky.logger.debug(f"Copied uninstaller script to {uninstaller_dest}")
 
             # Copy optiscaler config updater script
             optiscaler_config_updater_src = assets_dir / "update-optiscaler-config.py"
@@ -333,7 +384,7 @@ class Plugin:
             if optiscaler_config_updater_src.exists():
                 shutil.copy2(optiscaler_config_updater_src, optiscaler_config_updater_dest)
                 optiscaler_config_updater_dest.chmod(0o755)
-                decky.logger.info(f"Copied update-optiscaler-config.py script to {optiscaler_config_updater_dest}")
+                decky.logger.debug(f"Copied update-optiscaler-config.py script to {optiscaler_config_updater_dest}")
                 
             return True
         except Exception as e:
@@ -573,7 +624,7 @@ class Plugin:
                 # FGInput already present (INI already in v0.9-final format);
                 # just remove the now-unknown FGType line.
                 content = re.sub(r'^FGType\s*=\s*\S+\n?', '', content, flags=re.MULTILINE)
-                decky.logger.info(f"Removed stale FGType from {ini_file} (FGInput already present)")
+                decky.logger.debug(f"Removed stale FGType from {ini_file} (FGInput already present)")
             else:
                 # Replace the single FGType=X line with FGInput=X then FGOutput=X
                 content = re.sub(
@@ -582,7 +633,7 @@ class Plugin:
                     content,
                     flags=re.MULTILINE
                 )
-                decky.logger.info(f"Migrated FGType={fg_value} → FGInput={fg_value}, FGOutput={fg_value} in {ini_file}")
+                decky.logger.debug(f"Migrated FGType={fg_value} → FGInput={fg_value}, FGOutput={fg_value} in {ini_file}")
 
             with open(ini_file, 'w') as f:
                 f.write(content)
@@ -605,7 +656,7 @@ class Plugin:
             if updated_content != content:
                 with open(ini_file, 'w') as f:
                     f.write(updated_content)
-                decky.logger.info("Set UseHQFont=false to avoid missing font assertions")
+                decky.logger.debug("Set UseHQFont=false to avoid missing font assertions")
 
             return True
         except Exception as e:
@@ -637,7 +688,7 @@ class Plugin:
                 with open(ini_file, 'w') as f:
                     f.write(updated_content)
                 
-                decky.logger.info("Modified OptiScaler.ini to set FGInput=nukems, FGOutput=nukems, Fsr4Update=true, LoadAsiPlugins=true, UseHQFont=false")
+                decky.logger.debug("Modified OptiScaler.ini to set FGInput=nukems, FGOutput=nukems, Fsr4Update=true, LoadAsiPlugins=true, UseHQFont=false")
                 return True
             else:
                 decky.logger.warning(f"OptiScaler.ini not found at {ini_file}")
@@ -649,7 +700,7 @@ class Plugin:
     async def extract_static_optiscaler(self, selected_default_variant: str = DEFAULT_FSR4_VARIANT) -> dict:
         """Prepare the shared ~/fgmod bundle with all bundled FSR4 runtime variants."""
         try:
-            decky.logger.info("Starting extract_static_optiscaler method")
+            decky.logger.debug("Starting extract_static_optiscaler method")
 
             bin_path = Path(decky.DECKY_PLUGIN_DIR) / "bin"
             extract_path = Path(decky.HOME) / "fgmod"
@@ -828,7 +879,7 @@ class Plugin:
             
             if fgmod_path.exists():
                 shutil.rmtree(fgmod_path)
-                decky.logger.info(f"Removed directory: {fgmod_path}")
+                decky.logger.debug(f"Removed directory: {fgmod_path}")
                 return {
                     "status": "success", 
                     "output": "Successfully removed fgmod directory"
@@ -881,7 +932,7 @@ class Plugin:
 
     async def run_install_fgmod(self, selected_default_variant: str = DEFAULT_FSR4_VARIANT) -> dict:
         try:
-            decky.logger.info("Starting OptiScaler installation from static bundle")
+            decky.logger.debug("Starting OptiScaler installation from static bundle")
             selected_default_variant = self._normalize_fsr4_variant(selected_default_variant)
 
             extract_result = await self.extract_static_optiscaler(selected_default_variant)
@@ -984,7 +1035,7 @@ class Plugin:
                 if vendor in AMD_VENDOR_IDS:
                     devices.append({"vendor": vendor, "device": device})
         except Exception as exc:
-            decky.logger.info(f"[Framegen] sysfs GPU scan failed: {exc}")
+            decky.logger.debug(f"[Framegen] sysfs GPU scan failed: {exc}")
         return devices
 
     def _read_gpu_name_from_lspci(self) -> tuple[str, bool]:
@@ -992,7 +1043,7 @@ class Plugin:
         try:
             result = subprocess.run(["lspci"], capture_output=True, text=True, check=False)
         except Exception as exc:
-            decky.logger.info(f"[Framegen] lspci unavailable: {exc}")
+            decky.logger.debug(f"[Framegen] lspci unavailable: {exc}")
             return "", False
 
         fallback_name = ""
@@ -1012,27 +1063,7 @@ class Plugin:
         return fallback_name, False
 
     def _classify_amd_gpu(self, gpu_name: str, amd_devices: list[dict]) -> tuple[str, str]:
-        """Map a GPU name / device ids to (generation, recommended_variant)."""
-        name_low = (gpu_name or "").lower()
-
-        def matches(markers: list[str]) -> bool:
-            return any(marker in name_low for marker in markers)
-
-        if matches(RDNA4_NAME_MARKERS):
-            return "RDNA4", "rdna4-native"
-        if matches(RDNA35_NAME_MARKERS):
-            return "RDNA3.5", "rdna23-int8"
-        if matches(RDNA3_NAME_MARKERS):
-            return "RDNA3", "rdna23-int8"
-        if matches(RDNA2_NAME_MARKERS):
-            return "RDNA2", "rdna23-int8"
-
-        for device in amd_devices:
-            mapped = AMD_DEVICE_ID_MAP.get(device.get("device", ""))
-            if mapped:
-                return mapped[0], mapped[1]
-
-        return "AMD (generic)", DEFAULT_FSR4_VARIANT
+        return classify_amd_gpu(gpu_name, amd_devices)
 
     async def detect_gpu(self) -> dict:
         """Detect the primary GPU and recommend an FSR4 runtime variant."""
@@ -1051,7 +1082,7 @@ class Plugin:
             if recommended_variant not in FSR4_VARIANTS:
                 recommended_variant = DEFAULT_FSR4_VARIANT
 
-            decky.logger.info(
+            decky.logger.debug(
                 f"[Framegen] detect_gpu: name='{gpu_name}' amd={is_amd} "
                 f"gen={detected_generation} variant={recommended_variant} devices={amd_devices}"
             )
@@ -1076,7 +1107,7 @@ class Plugin:
             }
 
     def _resolve_target_directory(self, directory: str) -> Path:
-        decky.logger.info(f"Resolving target directory: {directory}")
+        decky.logger.debug(f"Resolving target directory: {directory}")
         target = Path(directory).expanduser()
         if not target.exists():
             raise FileNotFoundError(f"Target directory does not exist: {directory}")
@@ -1084,7 +1115,7 @@ class Plugin:
             raise NotADirectoryError(f"Target path is not a directory: {directory}")
         if not os.access(target, os.W_OK | os.X_OK):
             raise PermissionError(f"Insufficient permissions for {directory}")
-        decky.logger.info(f"Resolved directory {directory} to absolute path {target}")
+        decky.logger.debug(f"Resolved directory {directory} to absolute path {target}")
         return target
 
     def _manual_patch_directory_impl(
@@ -1124,12 +1155,12 @@ class Plugin:
         selected_upscaler_sha256 = self._file_sha256(selected_upscaler_src)
 
         try:
-            decky.logger.info(
+            decky.logger.debug(
                 f"Manual patch started for {directory} with FSR4 variant {selected_variant} ({selected_variant_info['label']})"
             )
 
             backed_up_proxies = self._backup_preexisting_proxy_files(directory, fgmod_path)
-            decky.logger.info(
+            decky.logger.debug(
                 f"Backed up pre-existing proxy files: {backed_up_proxies}"
                 if backed_up_proxies
                 else "No pre-existing proxy files required backup"
@@ -1141,7 +1172,7 @@ class Plugin:
                 if path.exists():
                     path.unlink()
                     removed_patch_files.append(filename)
-            decky.logger.info(
+            decky.logger.debug(
                 f"Removed stale patch files: {removed_patch_files}"
                 if removed_patch_files
                 else "No stale patch files found to remove"
@@ -1161,8 +1192,8 @@ class Plugin:
                 shutil.move(source, backup)
                 backed_up_originals.append(dll)
             if removed_managed_support:
-                decky.logger.info(f"Removed managed support files before repatch: {removed_managed_support}")
-            decky.logger.info(
+                decky.logger.debug(f"Removed managed support files before repatch: {removed_managed_support}")
+            decky.logger.debug(
                 f"Backed up original game DLLs: {backed_up_originals}"
                 if backed_up_originals
                 else "No original game DLLs required backup"
@@ -1172,15 +1203,15 @@ class Plugin:
             destination_dll = directory / dll_name
             source_for_copy = renamed if renamed.exists() else optiscaler_dll
             shutil.copy2(source_for_copy, destination_dll)
-            decky.logger.info(f"Copied injector DLL from {source_for_copy} to {destination_dll}")
+            decky.logger.debug(f"Copied injector DLL from {source_for_copy} to {destination_dll}")
 
             target_ini = directory / "OptiScaler.ini"
             source_ini = fgmod_path / "OptiScaler.ini"
             if preserve_ini and target_ini.exists():
-                decky.logger.info(f"Preserving existing OptiScaler.ini at {target_ini}")
+                decky.logger.debug(f"Preserving existing OptiScaler.ini at {target_ini}")
             elif source_ini.exists():
                 shutil.copy2(source_ini, target_ini)
-                decky.logger.info(f"Copied OptiScaler.ini from {source_ini} to {target_ini}")
+                decky.logger.debug(f"Copied OptiScaler.ini from {source_ini} to {target_ini}")
             else:
                 decky.logger.warning("No OptiScaler.ini found to copy")
 
@@ -1192,7 +1223,7 @@ class Plugin:
             plugins_dest = directory / "plugins"
             if plugins_src.exists():
                 shutil.copytree(plugins_src, plugins_dest, dirs_exist_ok=True)
-                decky.logger.info(f"Synced plugins directory from {plugins_src} to {plugins_dest}")
+                decky.logger.debug(f"Synced plugins directory from {plugins_src} to {plugins_dest}")
             else:
                 decky.logger.warning("Plugins directory missing in fgmod bundle")
 
@@ -1200,7 +1231,7 @@ class Plugin:
             d3d12_dest = directory / "D3D12_Optiscaler"
             if d3d12_src.exists():
                 shutil.copytree(d3d12_src, d3d12_dest, dirs_exist_ok=True)
-                decky.logger.info(f"Copied D3D12_Optiscaler directory to {d3d12_dest}")
+                decky.logger.debug(f"Copied D3D12_Optiscaler directory to {d3d12_dest}")
             else:
                 decky.logger.warning("D3D12_Optiscaler directory missing in fgmod bundle")
 
@@ -1229,7 +1260,7 @@ class Plugin:
                     missing_support.append(extra_file["name"])
 
             if copied_support:
-                decky.logger.info(f"Copied support files: {copied_support}")
+                decky.logger.debug(f"Copied support files: {copied_support}")
             if missing_support:
                 decky.logger.warning(f"Support files missing from fgmod bundle: {missing_support}")
 
@@ -1261,7 +1292,7 @@ class Plugin:
 
     def _manual_unpatch_directory_impl(self, directory: Path) -> dict:
         try:
-            decky.logger.info(f"Manual unpatch started for {directory}")
+            decky.logger.debug(f"Manual unpatch started for {directory}")
 
             removed_files = []
             for filename in set(INJECTOR_FILENAMES + SUPPORT_FILES + VARIANT_EXTRA_FILENAMES + [FSR4_UPSCALER_FILENAME]):
@@ -1269,7 +1300,7 @@ class Plugin:
                 if path.exists():
                     path.unlink()
                     removed_files.append(filename)
-            decky.logger.info(f"Removed injector/support files: {removed_files}" if removed_files else "No injector/support files found to remove")
+            decky.logger.debug(f"Removed injector/support files: {removed_files}" if removed_files else "No injector/support files found to remove")
 
             legacy_removed = []
             for legacy in LEGACY_FILES:
@@ -1280,17 +1311,17 @@ class Plugin:
                     except IsADirectoryError:
                         shutil.rmtree(path, ignore_errors=True)
                     legacy_removed.append(legacy)
-            decky.logger.info(f"Removed legacy artifacts: {legacy_removed}" if legacy_removed else "No legacy artifacts present")
+            decky.logger.debug(f"Removed legacy artifacts: {legacy_removed}" if legacy_removed else "No legacy artifacts present")
 
             plugins_dir = directory / "plugins"
             if plugins_dir.exists():
                 shutil.rmtree(plugins_dir, ignore_errors=True)
-                decky.logger.info(f"Removed plugins directory at {plugins_dir}")
+                decky.logger.debug(f"Removed plugins directory at {plugins_dir}")
 
             d3d12_dir = directory / "D3D12_Optiscaler"
             if d3d12_dir.exists():
                 shutil.rmtree(d3d12_dir, ignore_errors=True)
-                decky.logger.info(f"Removed D3D12_Optiscaler directory from {d3d12_dir}")
+                decky.logger.debug(f"Removed D3D12_Optiscaler directory from {d3d12_dir}")
 
             restored_backups = []
             for dll in dict.fromkeys(RESTORABLE_BACKUP_FILES):
@@ -1301,12 +1332,12 @@ class Plugin:
                         original.unlink()
                     shutil.move(backup, original)
                     restored_backups.append(dll)
-            decky.logger.info(f"Restored backups: {restored_backups}" if restored_backups else "No backups found to restore")
+            decky.logger.debug(f"Restored backups: {restored_backups}" if restored_backups else "No backups found to restore")
 
             uninstaller = directory / "fgmod-uninstaller.sh"
             if uninstaller.exists():
                 uninstaller.unlink()
-                decky.logger.info(f"Removed fgmod uninstaller at {uninstaller}")
+                decky.logger.debug(f"Removed fgmod uninstaller at {uninstaller}")
 
             decky.logger.info(f"Manual unpatch complete for {directory}")
             return {
@@ -1762,7 +1793,7 @@ class Plugin:
 
             # Auto-detect the right directory to patch
             target_dir, target_exe = self._guess_patch_target(game_info)
-            decky.logger.info(f"[Framegen] patch_game: appid={appid} dll={dll_name} target={target_dir} exe={target_exe}")
+            decky.logger.debug(f"[Framegen] patch_game: appid={appid} dll={dll_name} target={target_dir} exe={target_exe}")
 
             allow_managed_support_cleanup = bool(
                 existing_marker and existing_marker_target_dir == target_dir
@@ -1872,11 +1903,11 @@ class Plugin:
         try:
             path.mkdir(parents=True, exist_ok=True)
         except Exception as exc:
-            decky.logger.info(f"[Framegen] could not create fgmod data dir: {exc}")
+            decky.logger.debug(f"[Framegen] could not create fgmod data dir: {exc}")
         return path
 
     def _normalize_game_name(self, name: str) -> str:
-        return re.sub(r"[^a-z0-9]", "", (name or "").lower())
+        return normalize_game_name(name)
 
     def _scan_game_upscalers(self, install_path: Path) -> list[str]:
         """Depth-limited walk looking for known upscaler signature DLLs."""
@@ -1901,7 +1932,7 @@ class Plugin:
                 if len(found) >= total_techs:
                     break
         except Exception as exc:
-            decky.logger.info(f"[Framegen] upscaler scan failed for {install_path}: {exc}")
+            decky.logger.debug(f"[Framegen] upscaler scan failed for {install_path}: {exc}")
         return sorted(found)
 
     def _dir_signature(self, install_path: Path) -> str:
@@ -1918,32 +1949,33 @@ class Plugin:
         try:
             self._write_json_file(self._fgmod_data_dir() / SCAN_CACHE_FILENAME, cache)
         except Exception as exc:
-            decky.logger.info(f"[Framegen] failed to save scan cache: {exc}")
+            decky.logger.debug(f"[Framegen] failed to save scan cache: {exc}")
 
     def _parse_curated_markdown(self, raw: str) -> set[str]:
-        """Extract normalized game names from the first column of the wiki table."""
-        names: set[str] = set()
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line.startswith("|"):
-                continue
-            cells = [cell.strip() for cell in line.strip("|").split("|")]
-            if not cells:
-                continue
-            first = cells[0]
-            if not first or set(first) <= set("-: "):
-                continue
-            link_match = re.match(r"\[([^\]]+)\]\([^)]*\)", first)
-            if link_match:
-                first = link_match.group(1)
-            first = first.strip().strip("*").strip()
-            low = first.lower()
-            if low in ("game", "name") or first.startswith("#"):
-                continue
-            normalized = self._normalize_game_name(first)
-            if len(normalized) >= 2:
-                names.add(normalized)
-        return names
+        return parse_curated_markdown(raw)
+
+    def _fetch_curated_markdown(self) -> str:
+        """Fetch the curated compat markdown, retrying with a relaxed SSL
+        context if the default one fails to verify. SteamOS's bundled Python
+        can ship an incomplete CA bundle, which otherwise fails every call
+        silently and leaves every game looking "Unknown"."""
+        request = urllib.request.Request(
+            CURATED_COMPAT_URL, headers={"User-Agent": "Decky-Framegen"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except urllib.error.URLError as exc:
+            reason = getattr(exc, "reason", exc)
+            if not isinstance(reason, ssl.SSLCertVerificationError) and "CERTIFICATE_VERIFY_FAILED" not in str(reason):
+                raise
+            decky.logger.warning(
+                f"[Framegen] curated compat TLS verification failed ({reason}); "
+                "retrying with an unverified context. Consider updating system CA certificates."
+            )
+            unverified_context = ssl._create_unverified_context()
+            with urllib.request.urlopen(request, timeout=10, context=unverified_context) as response:
+                return response.read().decode("utf-8", errors="replace")
 
     def _load_curated_compat(self, force_refresh: bool = False) -> dict:
         cache_path = self._fgmod_data_dir() / CURATED_CACHE_FILENAME
@@ -1956,20 +1988,18 @@ class Plugin:
         ):
             return cached
         try:
-            request = urllib.request.Request(
-                CURATED_COMPAT_URL, headers={"User-Agent": "Decky-Framegen"}
-            )
-            with urllib.request.urlopen(request, timeout=10) as response:
-                raw = response.read().decode("utf-8", errors="replace")
+            raw = self._fetch_curated_markdown()
             names = self._parse_curated_markdown(raw)
             if names:
                 payload = {"fetched_at": now, "names": sorted(names), "count": len(names)}
                 self._write_json_file(cache_path, payload)
                 return payload
-            decky.logger.info("[Framegen] curated compat list parsed to 0 names; keeping cache")
+            decky.logger.warning("[Framegen] curated compat list parsed to 0 names; keeping cache")
         except Exception as exc:
-            decky.logger.info(f"[Framegen] curated compat fetch failed: {exc}")
-        return cached if cached.get("names") else {"fetched_at": 0, "names": [], "count": 0}
+            decky.logger.warning(f"[Framegen] curated compat fetch failed: {exc}")
+            cached = dict(cached)
+            cached["last_error"] = str(exc)
+        return cached if cached.get("names") else {"fetched_at": 0, "names": [], "count": 0, "last_error": cached.get("last_error")}
 
     def _load_overrides(self) -> dict:
         return self._read_json_file(self._fgmod_data_dir() / OVERRIDES_FILENAME)
@@ -2023,7 +2053,7 @@ class Plugin:
                         cache_dirty = True
 
                 scan_hit = len(upscalers) > 0
-                curated_hit = self._normalize_game_name(name) in curated_names
+                curated_hit = is_curated_match(name, curated_names)
                 override = overrides.get(appid)
 
                 sources: list[str] = []
@@ -2034,16 +2064,11 @@ class Plugin:
                 if override:
                     sources.append("override")
 
-                if override == "incompatible":
-                    compat = "no"
-                elif override == "compatible":
-                    compat = "yes"
-                elif scan_hit:
-                    compat = "yes"
-                elif curated_hit:
-                    compat = "likely"
-                else:
-                    compat = "unknown"
+                compat = classify_game_compat(
+                    scan_hit=scan_hit,
+                    curated_hit=curated_hit,
+                    override=override,
+                )
 
                 results.append({
                     "appid": appid,
@@ -2058,11 +2083,23 @@ class Plugin:
             if cache_dirty:
                 self._save_scan_cache(scan_cache)
 
+            verified_count = sum(1 for entry in results if entry["compat"] == "verified")
+            compatible_count = sum(1 for entry in results if entry["compat"] == "compatible")
+            unknown_count = sum(1 for entry in results if entry["compat"] == "unknown")
+            incompatible_count = sum(1 for entry in results if entry["compat"] == "incompatible")
+            decky.logger.debug(
+                "[Framegen] compat summary: "
+                f"verified={verified_count} compatible={compatible_count} "
+                f"unknown={unknown_count} incompatible={incompatible_count} "
+                f"curated_names={len(curated_names)} curated_error={curated.get('last_error')!r}"
+            )
+
             return {
                 "status": "success",
                 "games": results,
                 "curated_count": curated.get("count", len(curated_names)),
                 "curated_available": bool(curated_names),
+                "curated_error": curated.get("last_error"),
             }
         except Exception as exc:
             decky.logger.error(f"[Framegen] list_games_compatibility failed: {exc}")
